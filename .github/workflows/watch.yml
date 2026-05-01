@@ -1,20 +1,13 @@
 name: Watch campsites
 
 on:
-  # Cron: every 5 minutes. GitHub schedules best-effort under load,
-  # so expect 5-15 min in practice. 5 is the documented minimum.
   schedule:
     - cron: "*/5 * * * *"
-  # Allow manual runs from the Actions tab (good for first-time testing).
   workflow_dispatch:
 
-# Defense in depth: workflow has read-only permissions, so even if
-# something goes wrong, it can't push to the repo or open issues etc.
 permissions:
   contents: read
 
-# Only one run at a time. If a slow run is in progress, skip the next
-# scheduled tick rather than pile up.
 concurrency:
   group: watcher
   cancel-in-progress: false
@@ -22,23 +15,40 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          persist-credentials: false  # don't keep the GITHUB_TOKEN around
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
-      # Restore the previous run's state so we don't re-notify for the
-      # same availability over and over. Cache key uses run_id so we
-      # always save a fresh entry; restore-keys lets us pick up the
-      # most recent prior cache on a fuzzy match.
+      - name: Install Python deps
+        run: pip install -r requirements.txt
+
+      # Cache the Chromium browser binary across runs (~150 MB).
+      # Without this, every run downloads it fresh.
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+
+      - name: Install Chromium for Playwright
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install chromium --with-deps
+
+      - name: Install Chromium system deps (cache hit)
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+        run: python -m playwright install-deps chromium
+
       - name: Restore state cache
         uses: actions/cache@v4
         with:
@@ -49,7 +59,6 @@ jobs:
 
       - name: Run watcher
         env:
-          # Both come from GitHub Secrets. Never echo these.
           TARGETS_JSON: ${{ secrets.TARGETS_JSON }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: python watcher.py
