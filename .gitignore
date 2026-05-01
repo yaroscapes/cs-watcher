@@ -1,0 +1,22 @@
+# Local state — must NEVER be committed (contains target tracking data)
+.state.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Secrets — defense in depth: even if you accidentally make a .env locally,
+# this prevents committing it. Real secrets live in GitHub Secrets.
+.env
+.env.*
+secrets.json
+*.pem
+*.key
