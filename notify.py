@@ -1,10 +1,11 @@
 """ntfy.sh notification.
 
 Two notification flavors:
-  - notify(target)       — high-priority push when availability is found.
-  - notify_error(summary) — default-priority push when the watcher
-                            itself encounters errors (deduped by caller
-                            so you don't get spammed every 5 minutes).
+  - notify(target, available_dates, requested_dates) — high-priority push
+    when one or more nights become newly available.
+  - notify_error(summary) — default-priority push when the watcher itself
+    encounters errors (deduped by caller so you don't get spammed every
+    5 minutes).
 
 Security notes:
 - Topic name is read from env (NTFY_TOPIC). Never logged, never echoed.
@@ -53,20 +54,38 @@ def _post(topic: str, body: bytes, headers: dict) -> None:
         raise RuntimeError(f"ntfy network error: {type(e).__name__}") from None
 
 
-def notify(target: dict) -> None:
-    """Send a high-priority push about an availability hit.
+def notify(
+    target: dict,
+    newly_available: list[str],
+    total_available: list[str],
+    requested: list[str],
+) -> None:
+    """Send a high-priority push for newly available nights.
+
+    `newly_available` is the list of dates (sorted) that became available
+    this run (not previously seen). `total_available` is everything in
+    the requested window currently open. `requested` is everything
+    requested.
 
     Raises RuntimeError on any failure. Caller should catch broadly and
     log only the error class name to keep the public log clean.
     """
     topic = _resolve_topic()
 
-    title = f"Campsite open: {target.get('name', 'unknown')}"
-    body_lines = [
-        target.get("name", "unknown"),
-        f"Check-in: {target.get('checkin', '?')} ({target.get('nights', '?')} night(s))",
-        f"Party size: {target.get('party_size', '?')}",
-    ]
+    name = target.get("name", "unknown")
+    n_total = len(total_available)
+    n_req = len(requested)
+
+    if n_total == n_req:
+        title = f"{name}: all {n_req} night(s) open"
+    else:
+        title = f"{name}: {n_total} of {n_req} night(s) open"
+
+    body_lines = [name]
+    body_lines.append(f"Newly available: {', '.join(newly_available)}")
+    if total_available != newly_available:
+        body_lines.append(f"All open in window: {', '.join(total_available)}")
+    body_lines.append(f"Party size: {target.get('party_size', '?')}")
     if target.get("booking_url"):
         body_lines.append(f"Book: {target['booking_url']}")
     body = "\n".join(body_lines).encode("utf-8")
