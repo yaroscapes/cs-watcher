@@ -1,18 +1,16 @@
-name: Watch campsites
+name: watch cs
 
 on:
-  # Primary trigger: external cron service POSTs a repository_dispatch
+  # Primary trigger: external cron service POSTs a workflow_dispatch
   # every ~5 min via GitHub's API. Reliable, fires within seconds.
-  repository_dispatch:
-    types: [trigger-watcher]
+  # Requires only an Actions:Write fine-grained PAT (no Contents
+  # access — token can't push commits).
+  workflow_dispatch:
 
   # Backup trigger: GitHub's own scheduler (best-effort, often 15-60
   # min in practice). Only useful if the external cron stops firing.
   schedule:
     - cron: "*/30 * * * *"
-
-  # Manual trigger from the Actions tab.
-  workflow_dispatch:
 
 permissions:
   contents: read
