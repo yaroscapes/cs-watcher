@@ -188,8 +188,15 @@ def main() -> int:
 
     has_errors = bool(error_summaries)
 
-    # Error notification: only on clean -> error transition.
-    if has_errors and not prev_had_errors:
+    # Error notifications via ntfy are intentionally disabled. Transient
+    # failures happen (~3% of runs) and aren't actionable in real time.
+    # To re-enable, set the env var NOTIFY_ON_ERRORS=1 (in the workflow)
+    # and we'll push on the clean -> error transition.
+    if (
+        has_errors
+        and not prev_had_errors
+        and os.environ.get("NOTIFY_ON_ERRORS") == "1"
+    ):
         summary = f"{len(error_summaries)} issue(s): " + ", ".join(error_summaries)
         try:
             notify_error(summary)
