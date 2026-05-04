@@ -256,6 +256,15 @@ def check_system_b(target: dict) -> frozenset[str]:
       - map_id: int
       - resource_location_id: int
       - equipment_category_id: int
+
+    Optional:
+      - resource_id: int — if set, only this specific resource (e.g. one
+        campground within a multi-campground trail) counts as "open".
+        If unset, any resource at the location with availability counts.
+
+    Queries one night at a time so the result is per-night even on
+    deployments (e.g. BC Parks) that return aggregate availability per
+    resource without explicit per-date entries.
     """
     requested = _requested_dates(target)
     if not requested:
@@ -270,14 +279,23 @@ def check_system_b(target: dict) -> frozenset[str]:
     if not isinstance(host, str) or "/" in host or " " in host:
         raise ValueError("system_b: invalid host")
 
-    checkin = _dt.date.fromisoformat(target["checkin"])
-    end_date = checkin + _dt.timedelta(days=int(target["nights"]))
+    open_dates: set[str] = set()
+    for date_iso in requested:
+        if _system_b_night_open(date_iso, host, params, target):
+            open_dates.add(date_iso)
+    return frozenset(open_dates)
+
+
+def _system_b_night_open(date_iso: str, host: str, params: dict, target: dict) -> bool:
+    """One-night availability probe."""
+    night = _dt.date.fromisoformat(date_iso)
+    next_day = night + _dt.timedelta(days=1)
 
     qs = urllib.parse.urlencode({
         "mapId": int(params["map_id"]),
         "resourceLocationId": int(params["resource_location_id"]),
-        "startDate": checkin.isoformat(),
-        "endDate": end_date.isoformat(),
+        "startDate": night.isoformat(),
+        "endDate": next_day.isoformat(),
         "equipmentCategoryId": int(params["equipment_category_id"]),
         "partySize": int(target.get("party_size", 1)),
         "numEquipment": 1,
@@ -308,11 +326,11 @@ def check_system_b(target: dict) -> frozenset[str]:
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise RuntimeError("non-JSON response") from None
 
-    return _parse_system_b_response(data, requested)
+    return _system_b_response_indicates_open(data, params)
 
 
-def _parse_system_b_response(data: object, requested_dates: list[str]) -> frozenset[str]:
-    """Going-To-Camp / Aspira availability/map response."""
+def _system_b_response_indicates_open(data: object, params: dict) -> bool:
+    """True if any (or specific filtered) resource shows availability == 0."""
     if not isinstance(data, dict):
         raise RuntimeError("response not an object")
 
@@ -320,21 +338,15 @@ def _parse_system_b_response(data: object, requested_dates: list[str]) -> frozen
     if not isinstance(resources, dict):
         raise RuntimeError("missing resourceAvailabilities")
 
-    requested_set = set(requested_dates)
-    open_dates: set[str] = set()
+    filter_id = params.get("resource_id")
+    filter_str = str(filter_id) if filter_id is not None else None
 
-    for _resource_id, availabilities in resources.items():
+    for resource_key, availabilities in resources.items():
+        if filter_str is not None and str(resource_key) != filter_str:
+            continue
         if not isinstance(availabilities, list):
             continue
         for entry in availabilities:
-            if not isinstance(entry, dict):
-                continue
-            avail = entry.get("availability")
-            date_raw = entry.get("date")
-            if not isinstance(date_raw, str):
-                continue
-            iso_date = date_raw[:10]
-            if iso_date in requested_set and avail == 0:
-                open_dates.add(iso_date)
-
-    return frozenset(open_dates)
+            if isinstance(entry, dict) and entry.get("availability") == 0:
+                return True
+    return False
