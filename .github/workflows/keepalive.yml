@@ -1,0 +1,35 @@
+name: keepalive
+
+# GitHub auto-disables scheduled workflows after 60 days without a commit
+# to the repo (workflow_dispatch/schedule runs do NOT reset that timer —
+# only commits do). This job pushes an empty commit monthly so watch.yml
+# is never disabled for inactivity. It runs comfortably inside the 60-day
+# window, so it also keeps itself alive.
+#
+# Kept separate from watch.yml on purpose: the watcher is read-only
+# (contents: read, persist-credentials: false) so its token can't push.
+# This is the only workflow granted contents: write.
+
+on:
+  schedule:
+    - cron: "0 6 1 * *"   # 06:00 UTC on the 1st of each month
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: keepalive
+  cancel-in-progress: false
+
+jobs:
+  poke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Empty keepalive commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --allow-empty -m "chore: keepalive (reset 60-day inactivity timer)"
+          git push
