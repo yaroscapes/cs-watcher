@@ -149,6 +149,18 @@ def main() -> int:
 
         try:
             available = check_target(target)
+        except (RuntimeError, ValueError) as e:
+            # Safe to surface the message: every RuntimeError/ValueError
+            # raised in checkers.py carries either a developer-authored
+            # constant or an HTTP status code / exception class name.
+            # None interpolate response bodies, URLs, or target details,
+            # so this stays within the world-readable-log policy above.
+            # Other exception types fall through to the class-only branch.
+            cls = f"{type(e).__name__}: {e}"
+            print(f"Target {idx}: check failed ({cls})")
+            error_summaries.append(f"target {idx} ({cls})")
+            new_avail[key] = sorted(prev_dates_set)
+            continue
         except Exception as e:
             cls = type(e).__name__
             print(f"Target {idx}: check failed ({cls})")
