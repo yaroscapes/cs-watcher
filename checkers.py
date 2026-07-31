@@ -287,11 +287,11 @@ def _parse_system_a_response(data: object, requested_dates: list[str], category_
 
 
 # ---------------------------------------------------------------------------
-# system_b — Going-To-Camp / Aspira-style availability map. Plain HTTP works.
+# system_b — availability-map API. Plain HTTP works, no browser needed.
 # ---------------------------------------------------------------------------
 
 def check_system_b(target: dict) -> frozenset[str]:
-    """Going-To-Camp / Aspira /api/availability/map endpoint.
+    """Availability-map endpoint (`/api/availability/map` on the target host).
 
     Required `target['params']`:
       - host: API host
