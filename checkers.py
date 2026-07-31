@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import datetime as _dt
 import json
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -39,14 +40,55 @@ USER_AGENT = (
 REQUEST_TIMEOUT = 15
 BROWSER_TIMEOUT_MS = 60000
 
+# Pause between consecutive per-night probes of the same target. A wide
+# window is dozens of requests; without this they'd land as a burst.
+NIGHT_PROBE_DELAY_SECONDS = 0.25
 
-def _requested_dates(target: dict) -> list[str]:
-    """Expand checkin + nights into a list of ISO date strings."""
+_WEEKDAY_NAMES = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+}
+
+
+def _parse_weekdays(raw: object) -> frozenset[int]:
+    """Accept ["Thu","Fri",...] or [3,4,...]; Monday is 0."""
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raise ValueError("weekdays must be a non-empty list")
+    out: set[int] = set()
+    for item in raw:
+        # bool is an int subclass — reject it before the int branch.
+        if isinstance(item, bool):
+            raise ValueError("weekdays entries must be names or ints")
+        if isinstance(item, int):
+            if not 0 <= item <= 6:
+                raise ValueError("weekday int out of range")
+            out.add(item)
+        elif isinstance(item, str):
+            key = item.strip()[:3].lower()
+            if key not in _WEEKDAY_NAMES:
+                raise ValueError("unknown weekday name")
+            out.add(_WEEKDAY_NAMES[key])
+        else:
+            raise ValueError("weekdays entries must be names or ints")
+    return frozenset(out)
+
+
+def requested_dates(target: dict) -> list[str]:
+    """Expand checkin + nights into a list of ISO date strings.
+
+    Optional `target['weekdays']` narrows the span to specific nights of
+    the week, so one wide target can cover e.g. every Thursday-through-
+    Tuesday night across two months without also watching Wednesdays.
+    """
     checkin = _dt.date.fromisoformat(target["checkin"])
     nights = int(target["nights"])
     if nights < 1:
         raise ValueError("nights must be >= 1")
-    return [(checkin + _dt.timedelta(days=i)).isoformat() for i in range(nights)]
+    span = [checkin + _dt.timedelta(days=i) for i in range(nights)]
+    wanted = target.get("weekdays")
+    if wanted:
+        allowed = _parse_weekdays(wanted)
+        span = [d for d in span if d.weekday() in allowed]
+    return [d.isoformat() for d in span]
 
 
 def check_target(target: dict) -> frozenset[str]:
@@ -79,7 +121,7 @@ def check_system_a(target: dict) -> frozenset[str]:
       - tz: IANA timezone for "midnight local" date conversion
         (DST-aware, e.g. a Mountain Time zone)
     """
-    requested = _requested_dates(target)
+    requested = requested_dates(target)
     if not requested:
         return frozenset()
 
@@ -266,7 +308,7 @@ def check_system_b(target: dict) -> frozenset[str]:
     deployments (e.g. BC Parks) that return aggregate availability per
     resource without explicit per-date entries.
     """
-    requested = _requested_dates(target)
+    requested = requested_dates(target)
     if not requested:
         return frozenset()
 
@@ -280,7 +322,9 @@ def check_system_b(target: dict) -> frozenset[str]:
         raise ValueError("system_b: invalid host")
 
     open_dates: set[str] = set()
-    for date_iso in requested:
+    for i, date_iso in enumerate(requested):
+        if i:
+            time.sleep(NIGHT_PROBE_DELAY_SECONDS)
         if _system_b_night_open(date_iso, host, params, target):
             open_dates.add(date_iso)
     return frozenset(open_dates)
@@ -329,24 +373,60 @@ def _system_b_night_open(date_iso: str, host: str, params: dict, target: dict) -
     return _system_b_response_indicates_open(data, params)
 
 
+def _any_open(entries: object) -> bool:
+    """Availability code 0 means bookable; every other code means it isn't."""
+    if not isinstance(entries, list):
+        return False
+    return any(isinstance(e, dict) and e.get("availability") == 0 for e in entries)
+
+
 def _system_b_response_indicates_open(data: object, params: dict) -> bool:
-    """True if any (or specific filtered) resource shows availability == 0."""
+    """True if the requested night is bookable.
+
+    Three shapes occur in the wild:
+
+      - Leaf maps list individual sites under `resourceAvailabilities`.
+      - Some campgrounds are a *parent* map over per-loop child maps. They
+        return an empty `resourceAvailabilities` and report availability in
+        `mapAvailabilities` / `mapLinkAvailabilities` instead. Reading only
+        the resource field would report such a site as never available.
+      - `mapAvailabilities` is a bare list of codes, not dicts.
+    """
     if not isinstance(data, dict):
         raise RuntimeError("response not an object")
 
     resources = data.get("resourceAvailabilities")
-    if not isinstance(resources, dict):
-        raise RuntimeError("missing resourceAvailabilities")
+    map_levels = data.get("mapAvailabilities")
+    map_links = data.get("mapLinkAvailabilities")
+
+    if (
+        not isinstance(resources, dict)
+        and not isinstance(map_levels, list)
+        and not isinstance(map_links, dict)
+    ):
+        raise RuntimeError("no availability fields in response")
 
     filter_id = params.get("resource_id")
-    filter_str = str(filter_id) if filter_id is not None else None
+    if filter_id is not None:
+        # Precise mode: only the named resource counts. Deliberately no
+        # fallback to map-level signals — those aggregate every sibling,
+        # which would defeat the point of filtering to one campground.
+        if not isinstance(resources, dict) or not resources:
+            raise RuntimeError("resource_id set but no resources returned")
+        key = str(filter_id)
+        if key not in resources:
+            # A typo'd resource_id would otherwise look like "never open"
+            # forever. Fail loudly instead.
+            raise RuntimeError("resource_id not present in response")
+        return _any_open(resources[key])
 
-    for resource_key, availabilities in resources.items():
-        if filter_str is not None and str(resource_key) != filter_str:
-            continue
-        if not isinstance(availabilities, list):
-            continue
-        for entry in availabilities:
-            if isinstance(entry, dict) and entry.get("availability") == 0:
-                return True
+    if isinstance(resources, dict) and any(_any_open(v) for v in resources.values()):
+        return True
+    if isinstance(map_levels, list) and any(v == 0 for v in map_levels):
+        return True
+    if isinstance(map_links, dict):
+        return any(
+            isinstance(v, list) and any(code == 0 for code in v)
+            for v in map_links.values()
+        )
     return False

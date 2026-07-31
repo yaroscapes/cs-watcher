@@ -26,7 +26,7 @@ import os
 import sys
 from pathlib import Path
 
-from checkers import check_target
+from checkers import check_target, requested_dates
 from notify import notify, notify_error
 
 
@@ -68,7 +68,8 @@ def _save_state(state: dict) -> None:
 def _target_key(target: dict) -> str:
     """Stable identity for state-tracking. Never logged."""
     return "|".join(
-        str(target.get(k, "")) for k in ("system", "name", "checkin", "nights", "party_size")
+        str(target.get(k, ""))
+        for k in ("system", "name", "checkin", "nights", "party_size", "weekdays")
     )
 
 
@@ -95,13 +96,17 @@ def _validate_target(target: dict, idx: int) -> bool:
     except (TypeError, ValueError):
         print(f"Target {idx}: invalid (bad nights)")
         return False
+    if "weekdays" in target:
+        # Surface a malformed filter here rather than letting it raise
+        # mid-check, where it would be reported as a network-ish failure.
+        try:
+            if not requested_dates(target):
+                print(f"Target {idx}: invalid (weekdays filter matches no nights)")
+                return False
+        except ValueError:
+            print(f"Target {idx}: invalid (bad weekdays)")
+            return False
     return True
-
-
-def _requested_dates(target: dict) -> list[str]:
-    checkin = _dt.date.fromisoformat(target["checkin"])
-    nights = int(target["nights"])
-    return [(checkin + _dt.timedelta(days=i)).isoformat() for i in range(nights)]
 
 
 def main() -> int:
@@ -167,7 +172,7 @@ def main() -> int:
 
         # New availability — notify.
         try:
-            requested = _requested_dates(target)
+            requested = requested_dates(target)
             notify(
                 target,
                 newly_available=newly_open,
