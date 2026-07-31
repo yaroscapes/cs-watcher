@@ -22,8 +22,10 @@ secrets.json
 *.key
 
 # Local-only reference files (e.g. ids.local.json holds discovered booking
-# system IDs). Never committed — keeps target identities out of the public
-# repo while staying available locally for adding/changing targets.
+# system IDs, make_targets.local.py names the real booking platforms).
+# Never committed — keeps target identities out of the public repo while
+# staying available locally for adding/changing targets.
 *.local.json
 *.local.txt
+*.local.py
 *.local
