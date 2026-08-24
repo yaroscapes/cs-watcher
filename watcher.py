@@ -3,7 +3,8 @@
 Runs on a GitHub Actions cron. Reads target list and ntfy topic from
 environment (sourced from GitHub Secrets). For each target, calls the
 matching checker, which returns the set of dates within the requested
-window that are currently available.
+window that are currently available. "Dates" are nights for the
+campsite/hut systems and days for day-use ones (system_c).
 
 Notifications (all via ntfy.sh):
   - High priority push: one or more dates are *newly* available (not
@@ -82,7 +83,7 @@ def _validate_target(target: dict, idx: int) -> bool:
         if key not in target:
             print(f"Target {idx}: invalid (missing required field)")
             return False
-    if target["system"] not in ("system_a", "system_b"):
+    if target["system"] not in ("system_a", "system_b", "system_c"):
         print(f"Target {idx}: invalid (unknown system)")
         return False
     try:
@@ -171,6 +172,10 @@ def main() -> int:
             continue
 
         avail_set = set(available)
+        # Some checkers annotate each date with which slot opened. Read
+        # it off the returned object before any set arithmetic, which
+        # would drop the annotation.
+        details = getattr(available, "details", {})
         newly_open = sorted(avail_set - prev_dates_set)
         new_avail[key] = sorted(avail_set)
 
@@ -190,6 +195,7 @@ def main() -> int:
                 newly_available=newly_open,
                 total_available=sorted(avail_set),
                 requested=requested,
+                details=details,
             )
             new_hits += 1
             print(

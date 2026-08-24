@@ -2,7 +2,7 @@
 
 Two notification flavors:
   - notify(target, available_dates, requested_dates) — high-priority push
-    when one or more nights become newly available.
+    when one or more nights (or day-use slots) become newly available.
   - notify_error(summary) — default-priority push when the watcher itself
     encounters errors (deduped by caller so you don't get spammed every
     5 minutes).
@@ -17,6 +17,7 @@ Security notes:
 """
 from __future__ import annotations
 
+import datetime as _dt
 import os
 import urllib.error
 import urllib.request
@@ -54,49 +55,88 @@ def _post(topic: str, body: bytes, headers: dict) -> None:
         raise RuntimeError(f"ntfy network error: {type(e).__name__}") from None
 
 
+def _format_dates(dates: list[str], details: dict[str, list[str]]) -> str:
+    """Render dates, naming the specific slots that opened where known."""
+    if not details:
+        return ", ".join(dates)
+    parts = []
+    for date in dates:
+        labels = details.get(date)
+        parts.append(f"{date} ({', '.join(labels)})" if labels else date)
+    return "; ".join(parts)
+
+
+def _booking_url(target: dict, dates: list[str]) -> str:
+    """Resolve the target's booking URL.
+
+    A `{date}` placeholder is filled with the earliest date that just
+    opened, so day-use pushes deep-link straight to the right day
+    instead of the platform's default landing date. `{date+1}` is the
+    day after — some booking front-ends express a single day as a
+    half-open start/end pair and reject start == end.
+    """
+    url = target.get("booking_url") or ""
+    if not url or "{date" not in url:
+        return url
+    if not dates:
+        return ""
+    day = _dt.date.fromisoformat(dates[0])
+    url = url.replace("{date+1}", (day + _dt.timedelta(days=1)).isoformat())
+    return url.replace("{date}", day.isoformat())
+
+
 def notify(
     target: dict,
     newly_available: list[str],
     total_available: list[str],
     requested: list[str],
+    details: dict[str, list[str]] | None = None,
 ) -> None:
-    """Send a high-priority push for newly available nights.
+    """Send a high-priority push for newly available dates.
 
     `newly_available` is the list of dates (sorted) that became available
     this run (not previously seen). `total_available` is everything in
     the requested window currently open. `requested` is everything
-    requested.
+    requested. `details` optionally maps a date to the specific slots
+    that are open on it (day-use targets, where one date has several
+    bookable departure windows).
 
     Raises RuntimeError on any failure. Caller should catch broadly and
     log only the error class name to keep the public log clean.
     """
     topic = _resolve_topic()
+    details = details or {}
 
     name = target.get("name", "unknown")
+    # Nights for a campsite or hut, days for a day-use slot.
+    unit = target.get("unit", "night")
     n_total = len(total_available)
     n_req = len(requested)
 
     if n_total == n_req:
-        title = f"{name}: all {n_req} night(s) open"
+        title = f"{name}: all {n_req} {unit}(s) open"
     else:
-        title = f"{name}: {n_total} of {n_req} night(s) open"
+        title = f"{name}: {n_total} of {n_req} {unit}(s) open"
 
     body_lines = [name]
-    body_lines.append(f"Newly available: {', '.join(newly_available)}")
+    body_lines.append(f"Newly available: {_format_dates(newly_available, details)}")
     if total_available != newly_available:
-        body_lines.append(f"All open in window: {', '.join(total_available)}")
+        body_lines.append(
+            f"All open in window: {_format_dates(total_available, details)}"
+        )
     body_lines.append(f"Party size: {target.get('party_size', '?')}")
-    if target.get("booking_url"):
-        body_lines.append(f"Book: {target['booking_url']}")
+    url = _booking_url(target, newly_available)
+    if url:
+        body_lines.append(f"Book: {url}")
     body = "\n".join(body_lines).encode("utf-8")
 
     headers = {
         "Title": title,
         "Priority": "high",
-        "Tags": "tent,bell",
+        "Tags": str(target.get("tags") or "tent,bell"),
     }
-    if target.get("booking_url"):
-        headers["Click"] = target["booking_url"]
+    if url:
+        headers["Click"] = url
 
     _post(topic, body, headers)
 

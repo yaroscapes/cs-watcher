@@ -5,6 +5,12 @@ date strings (YYYY-MM-DD) for which the underlying booking platform
 shows availability, *within the requested window*. Empty set means
 nothing is available right now.
 
+A checker may return an `Availability` (a frozenset subclass) instead,
+which carries the same dates plus a per-date list of human-readable
+labels — used where one date has several bookable slots and knowing
+*which* one opened matters. Callers that don't care can treat it as a
+plain frozenset.
+
 Checkers raise on unexpected response shapes / HTTP errors so the
 watcher's error path fires (deduped on the watcher side).
 
@@ -44,6 +50,15 @@ BROWSER_TIMEOUT_MS = 60000
 # window is dozens of requests; without this they'd land as a burst.
 NIGHT_PROBE_DELAY_SECONDS = 0.25
 
+# Same idea for system_c, which probes once per departure-window map
+# rather than once per date.
+MAP_PROBE_DELAY_SECONDS = 0.25
+
+# Availability code meaning "bookable". Every other code the platform
+# returns (unavailable, not operating, doesn't match the search filters)
+# means it isn't.
+AVAILABILITY_OPEN = 0
+
 _WEEKDAY_NAMES = {
     "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
 }
@@ -72,12 +87,33 @@ def _parse_weekdays(raw: object) -> frozenset[int]:
     return frozenset(out)
 
 
+class Availability(frozenset):
+    """Set of available ISO dates, optionally annotated per date.
+
+    `details` maps an ISO date to the labels that were open on it, e.g.
+    {"2026-08-27": ["8am-9am", "9am-10am"]}. It is advisory: set
+    operations on this object return plain frozensets and drop it, so
+    read `details` off the value the checker returned, before diffing.
+    """
+
+    details: dict[str, list[str]]
+
+    def __new__(cls, dates, details: dict[str, list[str]] | None = None):
+        obj = super().__new__(cls, dates)
+        obj.details = {k: list(v) for k, v in (details or {}).items()}
+        return obj
+
+
 def requested_dates(target: dict) -> list[str]:
     """Expand checkin + nights into a list of ISO date strings.
 
     Optional `target['weekdays']` narrows the span to specific nights of
     the week, so one wide target can cover e.g. every Thursday-through-
     Tuesday night across two months without also watching Wednesdays.
+
+    Day-use targets (system_c) have no notion of a night; they reuse
+    `nights` as "days in the span" and lean on `weekdays` to pick out
+    the ones they care about.
     """
     checkin = _dt.date.fromisoformat(target["checkin"])
     nights = int(target["nights"])
@@ -97,6 +133,8 @@ def check_target(target: dict) -> frozenset[str]:
         return check_system_a(target)
     if system == "system_b":
         return check_system_b(target)
+    if system == "system_c":
+        return check_system_c(target)
     raise ValueError(f"unknown system: {system!r}")
 
 
@@ -377,7 +415,10 @@ def _any_open(entries: object) -> bool:
     """Availability code 0 means bookable; every other code means it isn't."""
     if not isinstance(entries, list):
         return False
-    return any(isinstance(e, dict) and e.get("availability") == 0 for e in entries)
+    return any(
+        isinstance(e, dict) and e.get("availability") == AVAILABILITY_OPEN
+        for e in entries
+    )
 
 
 def _system_b_response_indicates_open(data: object, params: dict) -> bool:
@@ -430,3 +471,220 @@ def _system_b_response_indicates_open(data: object, params: dict) -> bool:
             for v in map_links.values()
         )
     return False
+
+
+# ---------------------------------------------------------------------------
+# system_c — same platform as system_b, different product model: a timed
+# day-use slot booked for a *day*, not a site booked for a *night*. Plain
+# HTTPS works, no browser needed.
+# ---------------------------------------------------------------------------
+
+def check_system_c(target: dict) -> Availability:
+    """Timed-entry / day-use availability (`/api/availability/map`).
+
+    Required `target['params']`:
+      - host: API host
+      - booking_category_id: int — which day-use product this is
+      - capacity_category_id: int — how party size is expressed
+      - tz: IANA timezone of the location. Used for "now" when deciding
+        whether a last-minute pool has been released yet (see below).
+      - slots: list of {map_id, resource_id, label, last_minute?}. Each
+        entry is one bookable slot. Several slots normally share a
+        map_id; each distinct map is fetched exactly once, covering the
+        whole date span in a single request.
+
+    Optional:
+      - last_minute_lead_days: int, default 2
+      - last_minute_release_time: "HH:MM" local, default "08:00"
+
+    Slots flagged `last_minute` draw from a pool that is only released a
+    couple of days ahead. Before that release moment the API reports
+    them as available on *every* future date — nothing has been sold out
+    of a pool that hasn't opened — so counting them unconditionally
+    would fire an alert every run, forever. Each one is therefore only
+    counted once `last_minute_release_time` has passed on the day
+    `last_minute_lead_days` before the date being checked.
+    """
+    requested = requested_dates(target)
+    if not requested:
+        return Availability([])
+
+    params = target.get("params") or {}
+    for key in ("host", "booking_category_id", "capacity_category_id", "tz", "slots"):
+        if key not in params:
+            raise ValueError(f"system_c: missing param ({key})")
+
+    host = params["host"]
+    if not isinstance(host, str) or "/" in host or " " in host:
+        raise ValueError("system_c: invalid host")
+
+    slots = params["slots"]
+    if not isinstance(slots, list) or not slots:
+        raise ValueError("system_c: slots must be a non-empty list")
+
+    # Group by map so a target watching every departure window costs one
+    # request per window, not one per window per date. Insertion order is
+    # preserved, so maps are probed in the order the slots were listed.
+    by_map: dict[int, list[dict]] = {}
+    for slot in slots:
+        if not isinstance(slot, dict):
+            raise ValueError("system_c: slot is not an object")
+        for key in ("map_id", "resource_id", "label"):
+            if key not in slot:
+                raise ValueError(f"system_c: slot missing field ({key})")
+        by_map.setdefault(int(slot["map_id"]), []).append(slot)
+
+    tz = ZoneInfo(params["tz"])
+    now_local = _dt.datetime.now(tz)
+    lead_days = int(params.get("last_minute_lead_days", 2))
+    try:
+        release_time = _dt.time.fromisoformat(
+            str(params.get("last_minute_release_time", "08:00"))
+        )
+    except ValueError:
+        raise ValueError("system_c: bad last_minute_release_time") from None
+
+    span_start = _dt.date.fromisoformat(requested[0])
+    span_end = _dt.date.fromisoformat(requested[-1])
+    # The endpoint models a range the way it models a stay: endDate has to
+    # be strictly after startDate or it 400s, which a single-date target
+    # would otherwise trip on every run. Ask for one day past the last date
+    # we care about and ignore the extra. Both ends come back inclusive.
+    query_end = span_end + _dt.timedelta(days=1)
+    span_days = (query_end - span_start).days + 1
+
+    open_dates: set[str] = set()
+    details: dict[str, list[str]] = {}
+
+    for i, (map_id, map_slots) in enumerate(by_map.items()):
+        if i:
+            time.sleep(MAP_PROBE_DELAY_SECONDS)
+        codes_by_resource = _system_c_fetch_map(
+            map_id, span_start, query_end, host, params, target
+        )
+        for slot in map_slots:
+            codes = codes_by_resource.get(str(int(slot["resource_id"])))
+            if codes is None:
+                # A stale resource_id would otherwise look like "never
+                # open" forever. Fail loudly instead, as system_b does.
+                raise RuntimeError("system_c: slot resource not in response")
+            if len(codes) != span_days:
+                raise RuntimeError("system_c: availability length mismatch")
+            for date_iso in requested:
+                offset = (_dt.date.fromisoformat(date_iso) - span_start).days
+                if codes[offset] != AVAILABILITY_OPEN:
+                    continue
+                if slot.get("last_minute") and not _last_minute_released(
+                    date_iso, now_local, tz, lead_days, release_time
+                ):
+                    continue
+                open_dates.add(date_iso)
+                details.setdefault(date_iso, []).append(str(slot["label"]))
+
+    return Availability(open_dates, details)
+
+
+def _last_minute_released(
+    date_iso: str,
+    now_local: _dt.datetime,
+    tz: ZoneInfo,
+    lead_days: int,
+    release_time: _dt.time,
+) -> bool:
+    """Has the last-minute pool for `date_iso` opened yet?"""
+    day = _dt.date.fromisoformat(date_iso)
+    release = _dt.datetime.combine(
+        day - _dt.timedelta(days=lead_days), release_time, tzinfo=tz
+    )
+    return now_local >= release
+
+
+def _system_c_fetch_map(
+    map_id: int,
+    span_start: _dt.date,
+    span_end: _dt.date,
+    host: str,
+    params: dict,
+    target: dict,
+) -> dict[str, list[int]]:
+    """Fetch one map's per-day availability code for every resource on it.
+
+    `getDailyAvailability=true` makes the endpoint return one code per
+    day of the span (inclusive at both ends) instead of a single
+    aggregate, so a whole season costs one request. `span_end` must be
+    strictly after `span_start`.
+    """
+    qs = urllib.parse.urlencode({
+        "mapId": int(map_id),
+        "bookingCategoryId": int(params["booking_category_id"]),
+        # Day-use products carry no equipment and no cart context, but
+        # the endpoint still expects the keys to be present.
+        "equipmentCategoryId": "",
+        "subEquipmentCategoryId": "",
+        "cartUid": "",
+        "cartTransactionUid": "",
+        "bookingUid": "",
+        "groupHoldUid": "",
+        "startDate": span_start.isoformat(),
+        "endDate": span_end.isoformat(),
+        "getDailyAvailability": "true",
+        "isReserving": "true",
+        "filterData": "[]",
+        "boatLength": 0,
+        "boatDraft": 0,
+        "boatWidth": 0,
+        "peopleCapacityCategoryCounts": json.dumps(
+            [{
+                "capacityCategoryId": int(params["capacity_category_id"]),
+                "subCapacityCategoryId": None,
+                "count": int(target.get("party_size", 1)),
+            }],
+            separators=(",", ":"),
+        ),
+        "numEquipment": 0,
+    })
+    url = f"https://{host}/api/availability/map?{qs}"
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept": "application/json",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"http {resp.status}")
+            raw = resp.read()
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"http {e.code}") from None
+    except urllib.error.URLError as e:
+        raise RuntimeError(f"network ({type(e.reason).__name__})") from None
+
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise RuntimeError("non-JSON response") from None
+
+    if not isinstance(data, dict):
+        raise RuntimeError("response not an object")
+    resources = data.get("resourceAvailabilities")
+    if not isinstance(resources, dict) or not resources:
+        raise RuntimeError("no resourceAvailabilities in response")
+
+    out: dict[str, list[int]] = {}
+    for key, entries in resources.items():
+        if not isinstance(entries, list):
+            raise RuntimeError("resource availability not a list")
+        codes: list[int] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(
+                entry.get("availability"), int
+            ):
+                raise RuntimeError("malformed availability entry")
+            codes.append(entry["availability"])
+        out[key] = codes
+    return out
