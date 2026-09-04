@@ -68,4 +68,7 @@ jobs:
         env:
           TARGETS_JSON: ${{ secrets.TARGETS_JSON }}
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          # Everything NOT flagged `fast` — the flagged ones belong to
+          # watch-fast.yml, which runs browser-free on a tighter cron.
+          TIER: main
         run: python watcher.py

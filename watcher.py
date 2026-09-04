@@ -13,6 +13,17 @@ Notifications (all via ntfy.sh):
   - Default priority push: this run hit errors AND the previous run was
     clean. Deduped via state so a sustained outage = one push, not 84.
 
+Tiers:
+  Targets are split across two workflows by the optional `fast` flag.
+  A target that needs a browser (system_a) drags a ~100s Chromium setup
+  into every run, so the browser-free ones are checked by a separate,
+  dependency-free workflow on a much tighter cron — the difference
+  between catching a campsite that reopens for three minutes and missing
+  it. `TIER=fast` checks only flagged targets, `TIER=main` only the rest,
+  and an unset TIER checks everything (the old single-workflow behaviour).
+  Each workflow keeps its own state cache; they must not share one, or
+  each would overwrite the other's dedup history and re-notify.
+
 Logging policy (this is a public repo — Actions logs are world-readable):
   - Print only generic status: "Target N: <state>".
   - Never print target names, dates, party sizes, URLs, response bodies,
@@ -74,6 +85,18 @@ def _target_key(target: dict) -> str:
     )
 
 
+def _in_tier(target: dict, tier: str) -> bool:
+    """Is this target owned by the running workflow?
+
+    Unset tier means "check everything", so a single-workflow deployment
+    (and a local run) behaves exactly as it did before tiers existed.
+    """
+    if not tier:
+        return True
+    is_fast = bool(target.get("fast"))
+    return is_fast if tier == "fast" else not is_fast
+
+
 def _validate_target(target: dict, idx: int) -> bool:
     if not isinstance(target, dict):
         print(f"Target {idx}: invalid (not an object)")
@@ -130,7 +153,21 @@ def main() -> int:
         print("ERROR: NTFY_TOPIC not set", file=sys.stderr)
         return 1
 
-    print(f"Checking {len(targets)} target(s)...")
+    tier = os.environ.get("TIER", "").strip().lower()
+    if tier and tier not in ("fast", "main"):
+        print("ERROR: TIER must be 'fast' or 'main' if set", file=sys.stderr)
+        return 1
+
+    # Keep the original 1-based index even when a tier skips targets, so
+    # "Target 5" means the same target in both workflows' logs.
+    selected = [
+        (idx, t) for idx, t in enumerate(targets, start=1)
+        if not isinstance(t, dict) or _in_tier(t, tier)
+    ]
+    if tier:
+        print(f"Checking {len(selected)} of {len(targets)} target(s) [tier: {tier}]...")
+    else:
+        print(f"Checking {len(targets)} target(s)...")
 
     prev_state = _load_state()
     prev_avail = prev_state["availability"]
@@ -140,7 +177,7 @@ def main() -> int:
     new_hits = 0
     error_summaries: list[str] = []
 
-    for idx, target in enumerate(targets, start=1):
+    for idx, target in selected:
         if not _validate_target(target, idx):
             error_summaries.append(f"target {idx} (invalid config)")
             continue

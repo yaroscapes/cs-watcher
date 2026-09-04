@@ -1,0 +1,68 @@
+name: watch cs (fast)
+
+# Lean sibling of watch.yml for targets that don't need a browser.
+#
+# Why this exists: watch.yml installs Chromium and opens a Playwright
+# session per hut target, so a run takes ~100s before the browser-free
+# targets are even reached. Campsite cancellations routinely reopen for
+# under five minutes, so that overhead is the difference between catching
+# one and missing it. This job touches no third-party deps at all —
+# checkers.py imports Playwright lazily, inside the hut checker only — so
+# it finishes in ~15s and can be driven on a 1-minute cron.
+#
+# Targets are partitioned by the `fast` flag in TARGETS_JSON: this job
+# takes the flagged ones (TIER=fast), watch.yml takes the rest
+# (TIER=main). Nothing is checked twice, so no duplicate pushes.
+
+on:
+  # Primary trigger: external cron service POSTs a workflow_dispatch.
+  # Point a 1-minute job at this one, not at watch.yml.
+  workflow_dispatch:
+
+  # Backup only. GitHub's scheduler has 5-minute granularity and is
+  # best-effort anyway; the external cron is what makes this fast.
+  schedule:
+    - cron: "*/5 * * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  # Deliberately NOT the same group as watch.yml — sharing one would make
+  # this queue behind ~100s browser runs and undo the whole point.
+  group: watcher-fast
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Separate cache key from watch.yml on purpose. Each workflow saves
+      # state for its own targets only; sharing a key would let each wipe
+      # the other's dedup history and re-notify everything every run.
+      - name: Restore state cache
+        uses: actions/cache@v4
+        with:
+          path: .state.json
+          key: watcher-fast-state-${{ github.run_id }}
+          restore-keys: |
+            watcher-fast-state-
+
+      - name: Run watcher
+        env:
+          TARGETS_JSON: ${{ secrets.TARGETS_JSON }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TIER: fast
+        run: python watcher.py
