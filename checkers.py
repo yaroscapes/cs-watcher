@@ -427,11 +427,18 @@ def _system_b_response_indicates_open(data: object, params: dict) -> bool:
     Three shapes occur in the wild:
 
       - Leaf maps list individual sites under `resourceAvailabilities`.
+        That list is authoritative and is used on its own.
       - Some campgrounds are a *parent* map over per-loop child maps. They
         return an empty `resourceAvailabilities` and report availability in
         `mapAvailabilities` / `mapLinkAvailabilities` instead. Reading only
         the resource field would report such a site as never available.
       - `mapAvailabilities` is a bare list of codes, not dicts.
+
+    The map-level fields are consulted *only* when there is no site list,
+    because they are an unreliable proxy for "something is bookable" —
+    see the comment below. A parent map is therefore still checked more
+    loosely than a leaf one; if that ever produces phantom alerts, the
+    fix is to recurse into the child maps and read their site lists.
     """
     if not isinstance(data, dict):
         raise RuntimeError("response not an object")
@@ -461,15 +468,31 @@ def _system_b_response_indicates_open(data: object, params: dict) -> bool:
             raise RuntimeError("resource_id not present in response")
         return _any_open(resources[key])
 
-    if isinstance(resources, dict) and any(_any_open(v) for v in resources.values()):
-        return True
-    if isinstance(map_levels, list) and any(v == 0 for v in map_levels):
-        return True
-    if isinstance(map_links, dict):
+    if isinstance(resources, dict) and resources:
+        # Leaf map: the per-site list is the only trustworthy signal, so
+        # do NOT fall through to the map-level fields below.
+        #
+        # `mapAvailabilities` is the aggregate the booking UI uses to
+        # colour the map tab. On a leaf map it is not equivalent to "some
+        # site is bookable", and it is not even stable: sampling this
+        # endpoint every 5s for a campground whose 88 sites were all
+        # unavailable returned mapAvailabilities [0] on 10 of 18
+        # identical requests, flipping between [0] and [1] seconds apart.
+        # Honouring it here fired a false-positive push roughly every
+        # other run, each one pointing at a night with nothing bookable.
+        return any(_any_open(v) for v in resources.values())
+
+    # Parent map over per-loop child maps. It owns no sites, so the
+    # map-level fields are all there is. Prefer the per-child breakdown
+    # over the whole-map aggregate: it is narrower, and the aggregate has
+    # the instability described above.
+    if isinstance(map_links, dict) and map_links:
         return any(
             isinstance(v, list) and any(code == 0 for code in v)
             for v in map_links.values()
         )
+    if isinstance(map_levels, list) and any(v == 0 for v in map_levels):
+        return True
     return False
 
 
